@@ -40,13 +40,41 @@
   let isAdminUnlocked = false;
   let availabilityCache = {};
 
+  // FORMAT DATE
+  function formatDate(dateStr) {
+    const [y, m, d] = dateStr.split('-');
+    const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+    return d + ' ' + monthNames[parseInt(m)-1] + ' ' + y;
+  }
+
+  // GET ALL DATES BETWEEN TWO DATES INCLUSIVE
+  function getDateRange(startStr, endStr) {
+    const dates = [];
+    const start = new Date(startStr);
+    const end = new Date(endStr);
+    const cur = new Date(start);
+    while (cur <= end) {
+      const y = cur.getFullYear();
+      const m = String(cur.getMonth()+1).padStart(2,'0');
+      const d = String(cur.getDate()).padStart(2,'0');
+      dates.push(y+'-'+m+'-'+d);
+      cur.setDate(cur.getDate()+1);
+    }
+    return dates;
+  }
+
+  // LOAD DATA
   async function loadAllData() {
+    document.getElementById('loadingMsg').style.display = 'block';
+    document.getElementById('loadingMsg').textContent = 'Loading fleet availability...';
     try {
       const snapshot = await get(ref(db, 'availability'));
       availabilityCache = snapshot.exists() ? snapshot.val() : {};
+      document.getElementById('loadingMsg').style.display = 'none';
     } catch(e) {
-      availabilityCache = {};
+      document.getElementById('loadingMsg').textContent = 'Could not load data. Please refresh the page.';
     }
+    buildBikeFilters();
     renderCalendar();
   }
 
@@ -54,13 +82,21 @@
     return availabilityCache[bikeId + '_' + dateStr] || null;
   }
 
-  async function writeStatus(bikeId, dateStr, status, note) {
-    const key = bikeId + '_' + dateStr;
-    const entry = { status, note: note || '' };
-    availabilityCache[key] = entry;
-    await set(ref(db, 'availability/' + key), entry);
+  async function writeRangeStatus(bikeId, startStr, endStr, status, note) {
+    const dates = getDateRange(startStr, endStr);
+    const updates = {};
+    dates.forEach(dateStr => {
+      const key = bikeId + '_' + dateStr;
+      const entry = { status, note: note || '' };
+      availabilityCache[key] = entry;
+      updates['availability/' + key] = entry;
+    });
+    // Write all dates in one Firebase call
+    const { update } = await import("https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js");
+    await update(ref(db), updates);
   }
 
+  // BIKE FILTERS
   function buildBikeFilters() {
     const wrap = document.getElementById('bikeFilters');
     wrap.innerHTML = '';
@@ -90,6 +126,7 @@
     });
   }
 
+  // CALENDAR
   function renderCalendar() {
     const year = currentDate.getFullYear();
     const month = currentDate.getMonth();
@@ -127,6 +164,7 @@
     renderCalendar();
   };
 
+  // CLIENT BOOKING PANEL
   function showPanel(dateStr, status, day, monthName, year, entry) {
     const bike = BIKES.find(b => b.id === currentBike);
     document.getElementById('panelDate').textContent = day + ' ' + monthName + ' ' + year;
@@ -134,21 +172,48 @@
     const slots = document.getElementById('panelSlots');
     if (status === 'booked') {
       slots.innerHTML = '<div class="availability-row"><span class="avail-label">Status</span><span class="avail-badge badge-taken">Fully Booked</span></div>';
+      document.getElementById('waBtnWrap').style.display = 'none';
     } else if (status === 'partial') {
       slots.innerHTML = '<div class="availability-row"><span class="avail-label">Status</span><span class="avail-badge badge-free">Partially Available</span></div>' + (entry && entry.note ? '<div class="availability-row"><span class="avail-label">Note</span><span class="note-text">' + entry.note + '</span></div>' : '');
+      document.getElementById('waBtnWrap').style.display = 'block';
     } else {
       slots.innerHTML = '<div class="availability-row"><span class="avail-label">Status</span><span class="avail-badge badge-free">Available</span></div>';
+      document.getElementById('waBtnWrap').style.display = 'block';
     }
-    const waMsg = encodeURIComponent('Hi, I would like to book the ' + bike.name + ' on ' + day + ' ' + monthName + ' ' + year + '. Is it available?');
-    document.getElementById('waBtn').href = 'https://wa.me/905342768986?text=' + waMsg;
+    // Store selected date for range booking in WhatsApp message
+    document.getElementById('clientStartDate').value = dateStr;
+    document.getElementById('clientEndDate').value = dateStr;
+    document.getElementById('clientDateRange').style.display = status !== 'booked' ? 'block' : 'none';
+    updateClientWaLink(bike.name, dateStr, dateStr);
     const panel = document.getElementById('bookingPanel');
     panel.classList.add('visible');
     panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
+  window.updateClientWaLink = function(bikeName, start, end) {
+    const bike = bikeName || BIKES.find(b => b.id === currentBike).name;
+    const s = document.getElementById('clientStartDate').value || start;
+    const e = document.getElementById('clientEndDate').value || end;
+    const startFmt = formatDate(s);
+    const endFmt = formatDate(e);
+    const msg = s === e
+      ? 'Hi, I would like to book the ' + bike + ' on ' + startFmt + '. Is it available?'
+      : 'Hi, I would like to book the ' + bike + ' from ' + startFmt + ' to ' + endFmt + '. Is it available?';
+    document.getElementById('waBtn').href = 'https://wa.me/905342768986?text=' + encodeURIComponent(msg);
+  };
+
+  window.onClientDateChange = function() {
+    const bike = BIKES.find(b => b.id === currentBike).name;
+    const s = document.getElementById('clientStartDate').value;
+    const e = document.getElementById('clientEndDate').value;
+    if (e < s) document.getElementById('clientEndDate').value = s;
+    updateClientWaLink(bike, s, e);
+  };
+
   function closePanel() { document.getElementById('bookingPanel').classList.remove('visible'); }
   window.closePanel = closePanel;
 
+  // ADMIN
   window.openAdminModal = function() {
     if (isAdminUnlocked) { showAdminPanel(); return; }
     document.getElementById('passwordModal').classList.add('open');
@@ -180,15 +245,24 @@
   function showAdminPanel() {
     buildAdminSelect();
     document.getElementById('adminBike').value = currentBike;
-    const today = new Date();
-    document.getElementById('adminDate').value = today.toISOString().split('T')[0];
-    document.getElementById('adminDate').min = today.toISOString().split('T')[0];
+    const today = new Date().toISOString().split('T')[0];
+    document.getElementById('adminStartDate').value = today;
+    document.getElementById('adminEndDate').value = today;
+    document.getElementById('adminStartDate').min = today;
+    document.getElementById('adminEndDate').min = today;
     document.getElementById('adminNote').value = '';
     selectedStatus = 'available';
     document.querySelectorAll('.status-opt').forEach(o => o.classList.remove('sel'));
     document.querySelector('.status-opt[data-val="available"]').classList.add('sel');
     document.getElementById('adminModal').classList.add('open');
   }
+
+  window.onAdminStartChange = function() {
+    const s = document.getElementById('adminStartDate').value;
+    const e = document.getElementById('adminEndDate').value;
+    document.getElementById('adminEndDate').min = s;
+    if (e < s) document.getElementById('adminEndDate').value = s;
+  };
 
   window.closeAdminModal = function() { document.getElementById('adminModal').classList.remove('open'); };
 
@@ -200,24 +274,40 @@
 
   window.saveAvailability = async function() {
     const bikeId = document.getElementById('adminBike').value;
-    const date = document.getElementById('adminDate').value;
+    const startDate = document.getElementById('adminStartDate').value;
+    const endDate = document.getElementById('adminEndDate').value;
     const note = document.getElementById('adminNote').value;
-    if (!date) { alert('Please select a date.'); return; }
+    if (!startDate || !endDate) { alert('Please select dates.'); return; }
     const btn = document.querySelector('.btn-save');
     btn.textContent = 'Saving...';
     btn.disabled = true;
     try {
-      await writeStatus(bikeId, date, selectedStatus, note);
+      await writeRangeStatus(bikeId, startDate, endDate, selectedStatus, note);
       btn.textContent = 'Saved!';
-      setTimeout(() => { btn.textContent = 'Save'; btn.disabled = false; window.closeAdminModal(); renderCalendar(); }, 900);
+      window.closeAdminModal();
+      renderCalendar();
+      // BOOKING CONFIRMATION LOOP — only trigger if status is booked
+      if (selectedStatus === 'booked') {
+        const bike = BIKES.find(b => b.id === bikeId).name;
+        const startFmt = formatDate(startDate);
+        const endFmt = formatDate(endDate);
+        const confirmMsg = startDate === endDate
+          ? 'Hi! Your booking for the ' + bike + ' on ' + startFmt + ' is confirmed. Please contact us if you have any questions. Looking forward to riding with you - Demir Atlar Team.'
+          : 'Hi! Your booking for the ' + bike + ' from ' + startFmt + ' to ' + endFmt + ' is confirmed. Please contact us if you have any questions. Looking forward to riding with you - Demir Atlar Team.';
+        document.getElementById('confirmBike').textContent = bike;
+        document.getElementById('confirmDates').textContent = startDate === endDate ? startFmt : startFmt + ' to ' + endFmt;
+        document.getElementById('confirmWaBtn').href = 'https://wa.me/905342768986?text=' + encodeURIComponent(confirmMsg);
+        document.getElementById('confirmModal').classList.add('open');
+      }
+      setTimeout(() => { btn.textContent = 'Save'; btn.disabled = false; }, 900);
     } catch(e) {
       btn.textContent = 'Error - Retry';
       btn.disabled = false;
     }
   };
 
-  buildBikeFilters();
-  buildAdminSelect();
+  window.closeConfirmModal = function() { document.getElementById('confirmModal').classList.remove('open'); };
+
   loadAllData();
 </script>
 <style>
@@ -229,6 +319,9 @@ header::after{content:'';position:absolute;bottom:-1px;left:50%;transform:transl
 .brand-name{font-family:'Cinzel',serif;font-size:clamp(28px,5vw,42px);font-weight:700;letter-spacing:0.15em;background:linear-gradient(135deg,var(--gold),var(--gold-pale),var(--gold));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;text-transform:uppercase}
 .brand-tagline{font-size:11px;letter-spacing:0.35em;color:var(--text-muted);text-transform:uppercase;margin-top:6px}
 .page-title{font-family:'Cinzel',serif;font-size:clamp(13px,2vw,16px);letter-spacing:0.2em;color:var(--gold);text-transform:uppercase;margin-top:20px;font-weight:400}
+.loading-msg{text-align:center;font-size:11px;letter-spacing:0.2em;color:var(--gold);text-transform:uppercase;padding:20px;display:none}
+.loading-msg::after{content:'';animation:dots 1.2s infinite}
+@keyframes dots{0%{content:''}33%{content:'.'}66%{content:'..'}100%{content:'...'}}
 .container{max-width:1100px;margin:0 auto;padding:40px 20px 60px}
 .manage-bar{background:var(--dark-card);border:1px solid var(--border);border-radius:4px;padding:14px 20px;margin-bottom:28px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px}
 .manage-bar span{font-size:11px;letter-spacing:0.1em;color:var(--text-muted);text-transform:uppercase}
@@ -288,7 +381,12 @@ header::after{content:'';position:absolute;bottom:-1px;left:50%;transform:transl
 .badge-free{background:rgba(201,168,76,0.15);color:var(--gold-light);border:1px solid rgba(201,168,76,0.3)}
 .badge-taken{background:rgba(120,50,50,0.3);color:#c08080;border:1px solid rgba(180,60,60,0.3)}
 .note-text{font-size:12px;color:var(--text-muted)}
-.cta-btn{display:block;width:100%;margin-top:20px;padding:14px;background:linear-gradient(135deg,var(--gold),#a8852e);color:var(--dark);font-family:'Cinzel',serif;font-size:13px;font-weight:700;letter-spacing:0.2em;text-transform:uppercase;text-align:center;text-decoration:none;border:none;cursor:pointer;border-radius:2px;transition:all 0.25s ease;box-shadow:0 4px 20px rgba(201,168,76,0.2)}
+.date-range-wrap{margin-top:16px;padding-top:16px;border-top:1px solid var(--border)}
+.date-range-label{font-size:10px;letter-spacing:0.15em;color:var(--text-muted);text-transform:uppercase;margin-bottom:10px;font-weight:600}
+.date-range-row{display:flex;gap:10px;flex-wrap:wrap}
+.date-range-row input{flex:1;min-width:120px;background:var(--dark-card);border:1px solid var(--border);color:var(--text-main);font-family:'Raleway',sans-serif;font-size:12px;padding:8px 12px;border-radius:2px;outline:none;transition:border-color 0.2s;appearance:none;-webkit-appearance:none}
+.date-range-row input:focus{border-color:var(--gold)}
+.cta-btn{display:block;width:100%;margin-top:16px;padding:14px;background:linear-gradient(135deg,var(--gold),#a8852e);color:var(--dark);font-family:'Cinzel',serif;font-size:13px;font-weight:700;letter-spacing:0.2em;text-transform:uppercase;text-align:center;text-decoration:none;border:none;cursor:pointer;border-radius:2px;transition:all 0.25s ease;box-shadow:0 4px 20px rgba(201,168,76,0.2)}
 .cta-btn:hover{background:linear-gradient(135deg,var(--gold-pale),var(--gold));box-shadow:0 6px 28px rgba(201,168,76,0.35);transform:translateY(-1px)}
 .contact-bar{text-align:center;margin-top:48px;padding-top:32px;border-top:1px solid var(--border)}
 .contact-bar p{font-size:12px;color:var(--text-muted);letter-spacing:0.12em;text-transform:uppercase;margin-bottom:8px}
@@ -305,6 +403,8 @@ header::after{content:'';position:absolute;bottom:-1px;left:50%;transform:transl
 .form-group select,.form-group input{width:100%;background:var(--dark-card);border:1px solid var(--border);color:var(--text-main);font-family:'Raleway',sans-serif;font-size:13px;padding:10px 14px;border-radius:2px;outline:none;transition:border-color 0.2s;appearance:none;-webkit-appearance:none}
 .form-group select:focus,.form-group input:focus{border-color:var(--gold)}
 .form-group select option{background:var(--dark-card)}
+.form-row{display:flex;gap:12px}
+.form-row .form-group{flex:1}
 .status-row{display:flex;gap:10px}
 .status-opt{flex:1;text-align:center;padding:10px;border:1px solid var(--border);border-radius:2px;cursor:pointer;font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:var(--text-muted);transition:all 0.2s;font-weight:600}
 .status-opt[data-val="available"].sel{border-color:var(--gold);background:rgba(201,168,76,0.15);color:var(--gold-light)}
@@ -317,7 +417,11 @@ header::after{content:'';position:absolute;bottom:-1px;left:50%;transform:transl
 .btn-cancel:hover{border-color:var(--gold);color:var(--gold)}
 .pwd-error{color:#c08080;font-size:11px;letter-spacing:0.08em;margin-top:8px;display:none}
 .pwd-hint{font-size:11px;color:var(--text-muted);margin-top:8px;line-height:1.6}
-@media(max-width:600px){.cal-cell{min-height:42px}.cal-cell .day-num{font-size:12px}.cal-cell .day-status{font-size:7px}.bike-btn{font-size:11px;padding:8px 12px}}
+.confirm-summary{background:var(--dark-card);border:1px solid var(--border);border-radius:3px;padding:16px;margin-bottom:20px}
+.confirm-summary p{font-size:12px;color:var(--text-muted);line-height:1.8;letter-spacing:0.05em}
+.confirm-summary strong{color:var(--gold-light)}
+.confirm-hint{font-size:11px;color:var(--text-muted);margin-bottom:16px;line-height:1.6;letter-spacing:0.05em}
+@media(max-width:600px){.cal-cell{min-height:42px}.cal-cell .day-num{font-size:12px}.cal-cell .day-status{font-size:7px}.bike-btn{font-size:11px;padding:8px 12px}.form-row{flex-direction:column;gap:0}}
 </style>
 </head>
 <body>
@@ -326,13 +430,18 @@ header::after{content:'';position:absolute;bottom:-1px;left:50%;transform:transl
   <div class="brand-tagline">Your Journey, Our Iron</div>
   <div class="page-title">Fleet Availability</div>
 </header>
+
+<div class="loading-msg" id="loadingMsg">Loading fleet availability</div>
+
 <div class="container">
   <div class="manage-bar">
     <span>Check availability - then message us to book</span>
     <button class="manage-btn" onclick="openAdminModal()">Owner Login</button>
   </div>
+
   <div class="bikes-label">Select Bike</div>
   <div class="bike-filters" id="bikeFilters"></div>
+
   <div class="calendar-wrapper">
     <div class="cal-nav">
       <button onclick="changeMonth(-1)">Prev</button>
@@ -357,6 +466,8 @@ header::after{content:'';position:absolute;bottom:-1px;left:50%;transform:transl
       <div class="legend-item"><div class="legend-dot dot-booked"></div> Fully Booked</div>
     </div>
   </div>
+
+  <!-- CLIENT BOOKING PANEL -->
   <div class="booking-panel" id="bookingPanel">
     <div class="panel-header">
       <div class="panel-title">Booking Details</div>
@@ -366,9 +477,21 @@ header::after{content:'';position:absolute;bottom:-1px;left:50%;transform:transl
       <div class="panel-date" id="panelDate"></div>
       <div class="panel-bike-name" id="panelBike"></div>
       <div id="panelSlots"></div>
-      <a href="#" id="waBtn" target="_blank" class="cta-btn">Send Booking Request on WhatsApp</a>
+      <div id="clientDateRange" style="display:none">
+        <div class="date-range-wrap">
+          <div class="date-range-label">Select your rental dates</div>
+          <div class="date-range-row">
+            <input type="date" id="clientStartDate" onchange="onClientDateChange()">
+            <input type="date" id="clientEndDate" onchange="onClientDateChange()">
+          </div>
+        </div>
+      </div>
+      <div id="waBtnWrap">
+        <a href="#" id="waBtn" target="_blank" class="cta-btn">Send Booking Request on WhatsApp</a>
+      </div>
     </div>
   </div>
+
   <div class="contact-bar">
     <p>Inquiries and Bookings</p>
     <a href="tel:+905342768986">+90 534 276 8986</a>
@@ -410,9 +533,15 @@ header::after{content:'';position:absolute;bottom:-1px;left:50%;transform:transl
         <label>Bike</label>
         <select id="adminBike"></select>
       </div>
-      <div class="form-group">
-        <label>Date</label>
-        <input type="date" id="adminDate">
+      <div class="form-row">
+        <div class="form-group">
+          <label>Start Date</label>
+          <input type="date" id="adminStartDate" onchange="onAdminStartChange()">
+        </div>
+        <div class="form-group">
+          <label>End Date</label>
+          <input type="date" id="adminEndDate">
+        </div>
       </div>
       <div class="form-group">
         <label>Status</label>
@@ -433,5 +562,25 @@ header::after{content:'';position:absolute;bottom:-1px;left:50%;transform:transl
     </div>
   </div>
 </div>
+
+<!-- CONFIRMATION MODAL -->
+<div class="modal-overlay" id="confirmModal">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>Send Confirmation to Client</h3>
+      <button class="panel-close" onclick="closeConfirmModal()">X</button>
+    </div>
+    <div class="modal-body">
+      <div class="confirm-summary">
+        <p>Bike: <strong id="confirmBike"></strong></p>
+        <p>Dates: <strong id="confirmDates"></strong></p>
+      </div>
+      <p class="confirm-hint">Tap the button below to open WhatsApp with a pre-written confirmation message ready to send to your client.</p>
+      <a href="#" id="confirmWaBtn" target="_blank" class="cta-btn" onclick="closeConfirmModal()">Send Confirmation on WhatsApp</a>
+      <button class="btn-cancel" style="width:100%;margin-top:10px" onclick="closeConfirmModal()">Skip for Now</button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>
